@@ -1,5 +1,6 @@
 package fr.schwanx.vox.ui.home
 
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -78,6 +79,10 @@ fun HomeScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            // Keep read access for the background transcription worker.
+            try {
+                context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (ignored: SecurityException) {}
             onNavigateToTranscribe(it.toString())
         }
     }

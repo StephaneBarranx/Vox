@@ -1,6 +1,6 @@
 package fr.schwanx.vox
 
-import fr.schwanx.vox.core.native.WhisperEngine
+import fr.schwanx.vox.core.whisper.WhisperEngine
 import org.junit.Assert.assertFalse
 import org.junit.Test
 

@@ -52,6 +52,12 @@
             android:foregroundServiceType="microphone"
             android:exported="false" />
 
+        <!-- WorkManager foreground service used by TranscriptionWorker (setForeground with DATA_SYNC) -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
         <provider
             android:name="androidx.startup.InitializationProvider"
             android:authorities="${applicationId}.androidx-startup"

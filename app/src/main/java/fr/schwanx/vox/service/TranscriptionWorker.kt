@@ -19,13 +19,18 @@ import dagger.assisted.AssistedInject
 import fr.schwanx.vox.MainActivity
 import fr.schwanx.vox.R
 import fr.schwanx.vox.core.audio.AudioDecoder
-import fr.schwanx.vox.core.native.WhisperEngine
-import fr.schwanx.vox.core.native.WhisperProgressListener
+import fr.schwanx.vox.core.whisper.WhisperEngine
+import fr.schwanx.vox.core.whisper.WhisperProgressListener
 import fr.schwanx.vox.data.network.ModelDownloader
 import fr.schwanx.vox.data.repository.TranscriptionRepository
 import fr.schwanx.vox.domain.model.Segment
 import fr.schwanx.vox.domain.model.Transcription
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 
 @HiltWorker
 class TranscriptionWorker @AssistedInject constructor(
@@ -49,6 +54,14 @@ class TranscriptionWorker @AssistedInject constructor(
         const val KEY_NUM_THREADS = "key_num_threads"
 
         const val KEY_RESULT_TRANSCRIPTION_ID = "key_result_transcription_id"
+        const val KEY_PROGRESS = "key_progress"
+
+        private const val SAMPLE_RATE = 16000
+        private const val CHUNK_SECONDS = 5 * 60
+        private const val CUT_SEARCH_SECONDS = 10
+        private const val DECODE_PROGRESS_SHARE = 10
+
+        private val engineMutex = Mutex()
     }
 
     override suspend fun doWork(): Result {
@@ -60,7 +73,7 @@ class TranscriptionWorker @AssistedInject constructor(
 
         createNotificationChannel()
         try {
-            setForeground(createForegroundInfo("Décodage audio en cours...", 5))
+            setForeground(createForegroundInfo("Décodage audio en cours...", 0))
         } catch (e: Exception) {
             Log.e(TAG, "Failed to set foreground service", e)
         }
@@ -71,83 +84,188 @@ class TranscriptionWorker @AssistedInject constructor(
             return Result.failure()
         }
 
-        // Step 1: Decode audio to 16kHz PCM Float
-        val pcmData = audioDecoder.decodeAudioToPcmFloat(context, audioPath) { decodeProgress ->
-            val progressPct = (decodeProgress * 20f).toInt().coerceIn(0, 20)
-            try {
-                setForegroundAsync(createForegroundInfo("Décodage audio ($progressPct%)...", progressPct))
-            } catch (ignored: Exception) {}
-        }
-
-        if (pcmData.isEmpty()) {
-            Log.e(TAG, "Audio decoding produced empty PCM data")
-            return Result.failure()
-        }
-
-        // Step 2: Initialize Whisper engine
-        val initialized = whisperEngine.init(modelFile.absolutePath)
-        if (!initialized) {
-            Log.e(TAG, "Failed to initialize Whisper engine")
-            return Result.failure()
-        }
-
-        val segments = mutableListOf<Segment>()
-        val fullTextBuilder = StringBuilder()
-
-        val threadsToUse = if (numThreads > 0) numThreads else Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
-
-        // Step 3: Run Transcription
-        val resultCode = whisperEngine.transcribe(
-            pcmData = pcmData,
-            numThreads = threadsToUse,
-            language = language,
-            translate = false,
-            listener = object : WhisperProgressListener {
-                override fun onProgress(progress: Int) {
-                    val overallProgress = 20 + ((progress / 100f) * 75f).toInt()
-                    try {
-                        setForegroundAsync(createForegroundInfo("Transcription en cours ($overallProgress%)...", overallProgress))
-                    } catch (ignored: Exception) {}
-                }
-
-                override fun onNewSegment(startMs: Long, endMs: Long, text: String) {
-                    val trimmed = text.trim()
-                    if (trimmed.isNotEmpty()) {
-                        segments.add(Segment(startMs, endMs, trimmed))
-                        if (fullTextBuilder.isNotEmpty()) {
-                            fullTextBuilder.append(" ")
-                        }
-                        fullTextBuilder.append(trimmed)
-                    }
+        val pcmFile = File(context.cacheDir, "vox_pcm_${id}.f32")
+        try {
+            // Step 1: Decode audio to a 16 kHz mono float PCM file
+            var lastDecodePct = -1
+            val totalSamples = audioDecoder.decodeToPcmFile(context, audioPath, pcmFile) { decodeProgress ->
+                val pct = (decodeProgress * DECODE_PROGRESS_SHARE).toInt()
+                if (pct != lastDecodePct) {
+                    lastDecodePct = pct
+                    updateProgress("Décodage audio...", pct)
                 }
             }
-        )
 
-        whisperEngine.free()
+            if (totalSamples <= 0L) {
+                Log.e(TAG, "Audio decoding produced no PCM data")
+                return Result.failure()
+            }
 
-        if (resultCode != 0) {
-            Log.e(TAG, "Whisper transcription failed with result code $resultCode")
-            return Result.failure()
+            // The WhisperEngine singleton holds a single native context: run one
+            // transcription at a time, the others wait for their turn.
+            if (engineMutex.isLocked) {
+                updateProgress("En attente d'une autre transcription...", DECODE_PROGRESS_SHARE)
+            }
+            return engineMutex.withLock { transcribeAndSave(pcmFile, totalSamples, audioPath, modelFile, modelFilename, language, title, numThreads) }
+        } finally {
+            pcmFile.delete()
         }
+    }
 
-        val durationMs = (pcmData.size.toDouble() / 16000.0 * 1000.0).toLong()
-        val fullText = fullTextBuilder.toString().ifEmpty { "Aucun texte transcrit" }
+    private suspend fun transcribeAndSave(
+        pcmFile: File,
+        totalSamples: Long,
+        audioPath: String,
+        modelFile: File,
+        modelFilename: String,
+        language: String,
+        title: String,
+        numThreads: Int
+    ): Result {
+        try {
+            // Step 2: Initialize Whisper engine
+            updateProgress("Chargement du modèle...", DECODE_PROGRESS_SHARE)
+            if (!whisperEngine.init(modelFile.absolutePath, context.applicationInfo.nativeLibraryDir)) {
+                Log.e(TAG, "Failed to initialize Whisper engine")
+                return Result.failure()
+            }
 
-        // Step 4: Save to Room database
-        val transcription = Transcription(
-            title = title,
-            text = fullText,
-            segments = segments,
-            audioPath = audioPath,
-            durationMs = durationMs,
-            modelName = modelFilename,
-            language = language
-        )
+            val segments = mutableListOf<Segment>()
+            val threadsToUse = if (numThreads > 0) numThreads else WhisperEngine.defaultThreadCount()
 
-        val newId = repository.saveTranscription(transcription)
-        Log.i(TAG, "Transcription saved with ID $newId")
+            // Step 3: Transcribe chunk by chunk so long recordings never have to fit in memory.
+            // With "auto", the language detected on the first chunk is reused for
+            // the next ones: consistent output and one less encoder pass per chunk.
+            var chunkLanguage = language
+            var lastPct = -1
+            val ok = transcribeInChunks(pcmFile, totalSamples) { chunk, chunkStart ->
+                val offsetMs = chunkStart * 1000L / SAMPLE_RATE
+                val result = whisperEngine.transcribe(
+                    pcmData = chunk,
+                    numThreads = threadsToUse,
+                    language = chunkLanguage,
+                    translate = false,
+                    listener = object : WhisperProgressListener {
+                        override fun onProgress(progress: Int) {
+                            if (isStopped) {
+                                whisperEngine.cancel()
+                                return
+                            }
+                            val done = chunkStart + chunk.size * (progress / 100.0)
+                            val pct = DECODE_PROGRESS_SHARE +
+                                ((100 - DECODE_PROGRESS_SHARE) * done / totalSamples).toInt()
+                            if (pct != lastPct) {
+                                lastPct = pct
+                                updateProgress("Transcription en cours ($pct%)...", pct)
+                            }
+                        }
 
-        return Result.success(workDataOf(KEY_RESULT_TRANSCRIPTION_ID to newId))
+                        override fun onNewSegment(startMs: Long, endMs: Long, text: String) {
+                            val trimmed = text.trim()
+                            if (trimmed.isNotEmpty()) {
+                                segments.add(Segment(startMs + offsetMs, endMs + offsetMs, trimmed))
+                            }
+                        }
+                    }
+                )
+                if (result != 0) {
+                    Log.e(TAG, "Whisper transcription failed with result code $result")
+                } else if (chunkLanguage == "auto") {
+                    whisperEngine.detectedLanguage()?.let {
+                        Log.i(TAG, "Detected language: $it")
+                        chunkLanguage = it
+                    }
+                }
+                result == 0
+            }
+
+            if (!ok) return Result.failure()
+
+            val durationMs = totalSamples * 1000L / SAMPLE_RATE
+            val fullText = segments.joinToString(" ") { it.text }.ifEmpty { "Aucun texte transcrit" }
+
+            // Step 4: Save to Room database
+            val transcription = Transcription(
+                title = title,
+                text = fullText,
+                segments = segments,
+                audioPath = audioPath,
+                durationMs = durationMs,
+                modelName = modelFilename,
+                language = chunkLanguage
+            )
+
+            val newId = repository.saveTranscription(transcription)
+            Log.i(TAG, "Transcription saved with ID $newId")
+
+            return Result.success(workDataOf(KEY_RESULT_TRANSCRIPTION_ID to newId))
+        } finally {
+            whisperEngine.free()
+        }
+    }
+
+    /**
+     * Feeds the PCM file to [transcribeChunk] in chunks of about [CHUNK_SECONDS].
+     * Each chunk ends at the quietest point of its last seconds, so that words
+     * are not cut in half between two chunks. Stops at the first failure.
+     */
+    private inline fun transcribeInChunks(
+        pcmFile: File,
+        totalSamples: Long,
+        transcribeChunk: (chunk: FloatArray, chunkStart: Long) -> Boolean
+    ): Boolean {
+        val chunkSamples = CHUNK_SECONDS * SAMPLE_RATE
+        val searchSamples = CUT_SEARCH_SECONDS * SAMPLE_RATE
+        RandomAccessFile(pcmFile, "r").use { raf ->
+            val channel = raf.channel
+            var start = 0L
+            while (start < totalSamples) {
+                if (isStopped) return false
+                val remaining = totalSamples - start
+                // Avoid leaving a tiny last chunk: take everything if it nearly fits.
+                val isLast = remaining <= chunkSamples + searchSamples
+                val length = if (isLast) remaining.toInt() else chunkSamples
+                val chunk = FloatArray(length)
+                channel.map(FileChannel.MapMode.READ_ONLY, start * 4, length * 4L)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .asFloatBuffer()
+                    .get(chunk)
+
+                val cut = if (isLast) length else quietestCut(chunk, searchSamples)
+                val toTranscribe = if (cut == length) chunk else chunk.copyOf(cut)
+
+                if (!transcribeChunk(toTranscribe, start)) return false
+                start += cut
+            }
+        }
+        return true
+    }
+
+    /** Returns a cut index in the middle of the lowest-energy 100 ms window within the last [searchSamples]. */
+    private fun quietestCut(chunk: FloatArray, searchSamples: Int): Int {
+        val window = SAMPLE_RATE / 10
+        var bestCut = chunk.size
+        var bestEnergy = Double.MAX_VALUE
+        var windowStart = (chunk.size - searchSamples).coerceAtLeast(0)
+        while (windowStart + window <= chunk.size) {
+            var energy = 0.0
+            for (i in windowStart until windowStart + window) {
+                energy += chunk[i] * chunk[i]
+            }
+            if (energy < bestEnergy) {
+                bestEnergy = energy
+                bestCut = windowStart + window / 2
+            }
+            windowStart += window
+        }
+        return bestCut
+    }
+
+    private fun updateProgress(message: String, progress: Int) {
+        try {
+            setForegroundAsync(createForegroundInfo(message, progress))
+        } catch (ignored: Exception) {}
+        setProgressAsync(workDataOf(KEY_PROGRESS to progress))
     }
 
     private fun createForegroundInfo(message: String, progress: Int): ForegroundInfo {

@@ -89,7 +89,7 @@ class TranscribeViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(
                 isRunning = true,
                 errorMessage = null,
-                progressPercent = 5
+                progressPercent = 0
             )
 
             observeWork(request.id)
@@ -103,7 +103,11 @@ class TranscribeViewModel @Inject constructor(
                 if (workInfo != null) {
                     when (workInfo.state) {
                         WorkInfo.State.RUNNING -> {
-                            _uiState.value = _uiState.value.copy(isRunning = true)
+                            val progress = workInfo.progress.getInt(TranscriptionWorker.KEY_PROGRESS, -1)
+                            _uiState.value = _uiState.value.copy(
+                                isRunning = true,
+                                progressPercent = if (progress >= 0) progress else _uiState.value.progressPercent
+                            )
                         }
                         WorkInfo.State.SUCCEEDED -> {
                             val idResult = workInfo.outputData.getLong(TranscriptionWorker.KEY_RESULT_TRANSCRIPTION_ID, -1L)

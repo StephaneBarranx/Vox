@@ -209,12 +209,13 @@ fun TranscribeScreen(
             ) {
                 if (uiState.isRunning) {
                     CircularProgressIndicator(
+                        progress = { uiState.progressPercent / 100f },
                         modifier = Modifier.size(64.dp),
                         strokeWidth = 6.dp
                     )
                     Spacer(modifier = Modifier.height(24.dp))
                     Text(
-                        text = "Transcription en cours par Whisper...",
+                        text = "Transcription en cours par Whisper... ${uiState.progressPercent}%",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                         textAlign = TextAlign.Center
                     )
